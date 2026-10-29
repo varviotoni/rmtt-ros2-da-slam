@@ -3,7 +3,7 @@ set -euo pipefail
 
 # 1. Install HWE kernel and firmware (if not already installed)
 sudo apt-get update
-sudo apt-get install -y linux-generic-hwe-20.04 linux-firmware
+sudo apt-get install -y linux-generic-hwe-22.04 linux-firmware
 
 # 2. Blacklist btmtk to prevent Bluetooth coexistence latency spikes
 if ! grep -q "blacklist btmtk" /etc/modprobe.d/blacklist-btmtk.conf 2>/dev/null; then
