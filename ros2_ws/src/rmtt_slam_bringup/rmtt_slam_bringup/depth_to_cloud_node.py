@@ -14,12 +14,12 @@ import torch.nn.functional as F
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2, PointField
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 
 class DepthToCloudNode(Node):
-    """Runs Depth Anything V2 (Metric Indoor) calibrated by /tof_ext to publish /cloud_obstacles."""
+    """Runs Depth Anything V2 (Metric Indoor) with tilt compensation to publish /cloud_obstacles."""
 
     MODEL_ID = 'depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf'
 
@@ -38,27 +38,39 @@ class DepthToCloudNode(Node):
         # Configurable HSV threshold parameters for high-contrast towers
         self.declare_parameter('hsv_lower', [0, 0, 0])
         self.declare_parameter('hsv_upper', [180, 255, 255])
+        self.declare_parameter('min_range', 0.20)
+        self.declare_parameter('max_range', 4.00)
         self.declare_parameter('enable_undistortion', True)
         self.declare_parameter('dist_coeffs', self.DIST_COEFFS)
+
         self.enable_undistortion: bool = bool(
             self.get_parameter('enable_undistortion').value
         )
+        self.min_range: float = float(self.get_parameter('min_range').value)
+        self.max_range: float = float(self.get_parameter('max_range').value)
 
         self._cached_shape = None
         self._map1 = None
         self._map2 = None
         self._new_camera_matrix = None
 
+        self._latest_pitch_deg = 0.0
+        self._latest_roll_deg = 0.0
+
         self.bridge = CvBridge()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
 
-        # Publisher and Subscribers created immediately so topics are advertised on startup
+        # Publishers and Subscribers
         self.cloud_pub = self.create_publisher(PointCloud2, '/cloud_obstacles', 1)
         self.depth_image_pub = self.create_publisher(Image, '/depth/image_raw', 1)
         self.depth_vis_pub = self.create_publisher(Image, '/depth/image_vis', 1)
+
         self.image_sub = self.create_subscription(
             Image, '/image_raw', self._image_callback, 1
+        )
+        self.telemetry_sub = self.create_subscription(
+            String, '/telemetry_raw', self._telemetry_callback, 10
         )
 
         self.processor: Optional[AutoImageProcessor] = None
@@ -66,6 +78,21 @@ class DepthToCloudNode(Node):
         self._model_ready = False
         self._model_thread = threading.Thread(target=self._load_model, daemon=True)
         self._model_thread.start()
+
+    def _telemetry_callback(self, msg: String) -> None:
+        """Parse real-time pitch and roll from drone state packet to stabilize pointcloud."""
+        for item in msg.data.split(';'):
+            if ':' not in item:
+                continue
+            k, v = item.split(':', 1)
+            k = k.strip()
+            try:
+                if k == 'pitch':
+                    self._latest_pitch_deg = float(v.strip())
+                elif k == 'roll':
+                    self._latest_roll_deg = float(v.strip())
+            except ValueError:
+                continue
 
     def _load_model(self) -> None:
         """Load Depth Anything V2 Metric Indoor onto cuda:0 in torch.float16."""
@@ -164,8 +191,12 @@ class DepthToCloudNode(Node):
         self.depth_image_pub.publish(depth_msg)
 
         # Publish colorized depth map for direct visual inspection in RViz2 / rqt_image_view
-        depth_clipped = np.clip(depth_metric, 0.15, 4.5)
-        depth_norm = ((depth_clipped - 0.15) / (4.5 - 0.15) * 255.0).astype(np.uint8)
+        depth_clipped = np.clip(depth_metric, self.min_range, self.max_range)
+        depth_norm = (
+            (depth_clipped - self.min_range)
+            / max(0.01, (self.max_range - self.min_range))
+            * 255.0
+        ).astype(np.uint8)
         depth_vis_bgr = cv2.applyColorMap(255 - depth_norm, cv2.COLORMAP_INFERNO)
         vis_msg = self.bridge.cv2_to_imgmsg(depth_vis_bgr, encoding='bgr8')
         vis_msg.header = msg.header
@@ -177,9 +208,10 @@ class DepthToCloudNode(Node):
         hsv_lower = np.array(hsv_lower_param, dtype=np.uint8)
         hsv_upper = np.array(hsv_upper_param, dtype=np.uint8)
 
-        # Extract only rows within central horizontal band v in [H/2 - 60, H/2 + 60]
-        v_min = max(0, (height // 2) - 60)
-        v_max = min(height, (height // 2) + 60)
+        # Extract rows within central horizontal band, expanded to +/- 160 pixels
+        # so obstacles remain within the vertical field of view during drone pitch/roll
+        v_min = max(0, (height // 2) - 160)
+        v_max = min(height, (height // 2) + 160)
 
         # Downsample pixel grid by stride 4 for speed
         v_indices = np.arange(v_min, v_max, 4, dtype=np.int32)
@@ -193,8 +225,8 @@ class DepthToCloudNode(Node):
         valid_mask = (
             hsv_mask
             & np.isfinite(band_depth)
-            & (band_depth >= 0.15)
-            & (band_depth <= 4.5)
+            & (band_depth >= self.min_range)
+            & (band_depth <= self.max_range)
         )
 
         uu, vv = np.meshgrid(u_indices.astype(np.float32), v_indices.astype(np.float32))
@@ -202,12 +234,33 @@ class DepthToCloudNode(Node):
         v_valid = vv[valid_mask]
         z_cam = band_depth[valid_mask].astype(np.float32)
 
-        # 3D Back-Projection to base_stabilized (ROS FLU)
-        x_flu = z_cam
-        y_flu = -((u_valid - cx) * z_cam) / fx
-        z_flu = -((v_valid - cy) * z_cam) / fy
+        # 3D Back-Projection from camera coordinates to body FLU frame
+        x_body = z_cam
+        y_body = -((u_valid - cx) * z_cam) / fx
+        z_body = -((v_valid - cy) * z_cam) / fy
 
-        points = np.stack((x_flu, y_flu, z_flu), axis=-1).astype(np.float32)
+        # Tilt compensation (pitch & roll) to project into base_stabilized (horizontal world-aligned frame)
+        # In Tello SDK: pitch nose-down is negative. In ROS FLU: nose-down is positive rotation about +Y.
+        theta = -math.radians(self._latest_pitch_deg)
+        phi = -math.radians(self._latest_roll_deg)
+
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        cos_p = math.cos(phi)
+        sin_p = math.sin(phi)
+
+        # Apply rotation R = R_y(theta) * R_x(phi)
+        y_rot = cos_p * y_body - sin_p * z_body
+        z_mid = sin_p * y_body + cos_p * z_body
+        x_stab = cos_t * x_body + sin_t * z_mid
+        y_stab = y_rot
+        z_stab = -sin_t * x_body + cos_t * z_mid
+
+        # Add physical camera mount offset relative to drone base center (0.03m forward, 0.02m up)
+        x_stab += 0.03
+        z_stab += 0.02
+
+        points = np.stack((x_stab, y_stab, z_stab), axis=-1).astype(np.float32)
 
         cloud_msg = self._create_pointcloud2(points, msg.header.stamp, 'base_stabilized')
         self.cloud_pub.publish(cloud_msg)

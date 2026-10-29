@@ -17,8 +17,10 @@ slam_toolbox:
     max_laser_range: 4.5
     minimum_travel_distance: 0.1
     minimum_travel_heading: 0.1
-    transform_timeout: 0.2
+    transform_timeout: 0.5
     tf_buffer_duration: 30.0
     map_update_interval: 1.0
     use_scan_matching: true
-    use_scan_barycenter: true
+    # Disable scan barycenter: with a narrow ~55-deg camera FOV, towers entering/exiting
+    # the image frame cause the scan centroid to jump wildly and corrupt the pose estimate.
+    use_scan_barycenter: false

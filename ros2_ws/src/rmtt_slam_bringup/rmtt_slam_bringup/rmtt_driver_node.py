@@ -15,6 +15,7 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rclpy.duration import Duration
 from rclpy.node import Node
 from sensor_msgs.msg import Image, Range
 from std_msgs.msg import String
@@ -248,6 +249,28 @@ class RmttDriverNode(Node):
             odom_msg.pose.pose.orientation.w = math.cos(half_psi)
             odom_msg.twist.twist.linear.x = vx
             odom_msg.twist.twist.linear.y = vy
+
+            # Realistic diagonal covariances for robot_localization EKF
+            # pose: [x, y, z, roll, pitch, yaw]
+            pose_cov = [0.0] * 36
+            pose_cov[0] = 1.0       # x (unmeasured by raw odom)
+            pose_cov[7] = 1.0       # y (unmeasured by raw odom)
+            pose_cov[14] = 0.01     # z (bottom ToF range)
+            pose_cov[21] = 0.1      # roll
+            pose_cov[28] = 0.1      # pitch
+            pose_cov[35] = 0.05     # yaw (IMU compass/gyro)
+            odom_msg.pose.covariance = pose_cov
+
+            # twist: [vx, vy, vz, vroll, vpitch, vyaw]
+            twist_cov = [0.0] * 36
+            twist_cov[0] = 0.05     # vx (optical flow / integrated)
+            twist_cov[7] = 0.05     # vy
+            twist_cov[14] = 0.1     # vz
+            twist_cov[21] = 0.5     # vroll
+            twist_cov[28] = 0.5     # vpitch
+            twist_cov[35] = 0.5     # vyaw
+            odom_msg.twist.covariance = twist_cov
+
             self.odom_pub.publish(odom_msg)
 
             btm_msg = Range()
@@ -261,8 +284,10 @@ class RmttDriverNode(Node):
             self.tof_btm_pub.publish(btm_msg)
 
     def _video_decode_loop(self) -> None:
-        """Decode H.264 stream on UDP 11111 and publish /image_raw throttled to 10 Hz."""
+        """Decode H.264 stream on UDP 11111, drop corrupt/smeared frames, and publish /image_raw at 10 Hz."""
         last_pub_time = 0.0
+        waiting_for_keyframe = False
+
         while self._running and rclpy.ok():
             container: Optional[av.container.InputContainer] = None
             try:
@@ -271,6 +296,9 @@ class RmttDriverNode(Node):
                     options={
                         'fflags': 'nobuffer+discardcorrupt',
                         'flags': 'low_delay',
+                        'flags2': '+drop_corrupt',
+                        'err_detect': 'crccheck+bitstream+buffer',
+                        'ec': '0',  # Disable error concealment (prevents smearing missing macroblocks)
                         'probesize': '32',
                         'analyzeduration': '0',
                         'max_delay': '0',
@@ -280,18 +308,43 @@ class RmttDriverNode(Node):
                 for frame in container.decode(video=0):
                     if not (self._running and rclpy.ok()):
                         break
+
+                    # 1. Drop frames flagged as corrupt by FFmpeg decoder
+                    if getattr(frame, 'is_corrupt', False):
+                        waiting_for_keyframe = True
+                        continue
+
+                    # 2. Keyframe resynchronization:
+                    # In H.264 over UDP, packet loss breaks reference pictures.
+                    # All following P-frames will smear macroblocks until the next clean I-frame (keyframe).
+                    # Drop all subsequent frames until an I-frame arrives.
+                    if waiting_for_keyframe:
+                        if not getattr(frame, 'key_frame', False):
+                            continue
+                        waiting_for_keyframe = False
+
+                    # 3. Sanity check frame validity
+                    if frame.width <= 0 or frame.height <= 0:
+                        continue
+
                     now = time.monotonic()
                     # Throttle ROS 2 image publishing to 10 Hz so depth_to_cloud_node
                     # and FastDDS never back-pressure or starve the main executor thread.
                     if (now - last_pub_time) < 0.10:
                         continue
                     last_pub_time = now
+
                     bgr_img = frame.to_ndarray(format='bgr24')
                     img_msg = self.bridge.cv2_to_imgmsg(bgr_img, encoding='bgr8')
-                    img_msg.header.stamp = self.get_clock().now().to_msg()
+                    # Compensate for H.264 encode/Wi-Fi/decode latency (~150 ms)
+                    # so the optical scan aligns with the historical odometry pose from when photons hit the sensor.
+                    now_stamp = self.get_clock().now()
+                    comp_stamp = now_stamp - Duration(seconds=0.15)
+                    img_msg.header.stamp = comp_stamp.to_msg()
                     img_msg.header.frame_id = 'camera_link'
                     self.image_pub.publish(img_msg)
-            except Exception:
+            except (av.AVError, Exception):
+                waiting_for_keyframe = True
                 time.sleep(1.0)
             finally:
                 if container is not None:

@@ -74,7 +74,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[
             {
                 'target_frame': 'base_stabilized',
-                'transform_tolerance': 0.05,
+                'transform_tolerance': 0.15,
                 'min_height': -0.20,
                 'max_height': 0.20,
                 'range_min': 0.15,
